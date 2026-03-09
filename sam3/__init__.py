@@ -3,7 +3,8 @@
 # pyre-unsafe
 
 from .model_builder import build_sam3_image_model
+from .streaming_tracker import SAM3StreamingTracker
 
 __version__ = "0.1.0"
 
-__all__ = ["build_sam3_image_model"]
+__all__ = ["build_sam3_image_model", "SAM3StreamingTracker"]
