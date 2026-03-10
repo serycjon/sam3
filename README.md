@@ -1,5 +1,8 @@
-# SAM 3: Segment Anything with Concepts
+# SAM 3: Segment Anything with Concepts -- a version with Streaming API
 
+Streaming version by Jonas Serych
+
+Original authors:
 Meta Superintelligence Labs
 
 [Nicolas Carion](https://www.nicolascarion.com/)\*,
@@ -102,6 +105,11 @@ Hugging Face [repo](https://huggingface.co/facebook/sam3). Once accepted, you
 need to be authenticated to download the checkpoints. You can do this by running
 the following [steps](https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication)
 (e.g. `hf auth login` after generating an access token.)
+
+### Streaming API basic usage
+Shown in `examples/demo.py`
+
+Test it with `python examples/demo.py` which will start populating a `streaming_demo_out` directory with segmentation tracking results on a 50000 frames long forward-backward cycling video.
 
 ### Basic Usage
 
