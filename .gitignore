@@ -151,4 +151,3 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
-/jonout/
