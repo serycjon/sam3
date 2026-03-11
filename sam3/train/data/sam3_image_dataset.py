@@ -17,14 +17,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.utils.data
 import torchvision
-from decord import cpu, VideoReader
 from iopath.common.file_io import g_pathmgr
 from PIL import Image as PILImage
 from PIL.Image import DecompressionBombError
 from sam3.model.box_ops import box_xywh_to_xyxy
 from torchvision.datasets.vision import VisionDataset
 
-from .coco_json_loaders import COCO_FROM_JSON
+try:
+    from .coco_json_loaders import COCO_FROM_JSON
+except ImportError:
+    COCO_FROM_JSON = None
 
 
 @dataclass
@@ -201,6 +203,8 @@ class CustomCocoDetectionAPI(VisionDataset):
             path = os.path.join(self.root, path)
             try:
                 if ".mp4" in path and path[-4:] == ".mp4":
+                    from decord import cpu, VideoReader
+
                     # Going to load a video frame
                     video_path, frame = path.split("@")
                     video = VideoReader(video_path, ctx=cpu(0))
