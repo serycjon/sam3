@@ -78,8 +78,8 @@ class SAM3StreamingTracker:
             inference_state=self.inference_state,
             frame_idx=self.frame_idx,
             obj_id=self.obj_id,
-            frame=frame,
-            mask=torch.from_numpy(mask),
+            frame=frame.copy(),
+            mask=torch.from_numpy(mask.copy()),
         )
         
         # Prepare for tracking
@@ -102,7 +102,7 @@ class SAM3StreamingTracker:
         
         # Run tracking on this frame
         sam_outputs = self.predictor.propagate_in_video_single(
-            self.inference_state, frame, self.frame_idx
+            self.inference_state, frame.copy(), self.frame_idx
         )
         frame_idx, object_ids, low_res_mask, video_res_mask, obj_scores = sam_outputs
 
