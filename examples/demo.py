@@ -63,6 +63,11 @@ def forward_backward(gen):
         for item in buffer:
             yield item
 
+def repeat_first(gen):
+    item = next(gen)
+
+    while True:
+        yield item
 
 def main():
     data_dir = Path(__file__).parent.parent / 'assets' / 'videos'
