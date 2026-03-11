@@ -1712,7 +1712,7 @@ def _load_img_from_opencv_uint8(frame, image_size, device='cuda'):
     rgb = frame[:, :, ::-1]
     img_np = np.array(Image.fromarray(rgb).resize((image_size, image_size))) / 255.0
     img = torch.from_numpy(img_np).permute(2, 0, 1)
-    image = img.to(device)
+    image = img.float().to(device)
 
     img_mean, img_std = _get_mean_std(img_mean=(0.5, 0.5, 0.5), img_std=(0.5, 0.5, 0.5), device=device)
 
