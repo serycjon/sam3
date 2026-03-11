@@ -82,10 +82,11 @@ def main():
         else:
             mask = tracker.track(frame)
 
-        frame[mask, 2] = 255
+        vis = frame.copy()
+        vis[mask, 2] = 255
 
         out_path = out_dir / f'{frame_idx:05d}.jpg'
-        cv2.imwrite(str(out_path), frame)
+        cv2.imwrite(str(out_path), vis)
 
         if frame_idx > 50000:
             break
