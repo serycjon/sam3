@@ -206,6 +206,8 @@ class CustomCocoDetectionAPI(VisionDataset):
                     from decord import cpu, VideoReader
 
                     # Going to load a video frame
+                    from decord import cpu, VideoReader
+
                     video_path, frame = path.split("@")
                     video = VideoReader(video_path, ctx=cpu(0))
                     # Convert to PIL image

@@ -40,20 +40,37 @@ variants of the upstream batched methods).
 
 ---
 
+## Latest updates
+
+**03/27/2026 -- SAM 3.1 Object Multiplex is released. It introduces a shared-memory approach for joint multi-object tracking that is significantly faster without sacrificing accuracy.**
+
+- A new suite of improved model checkpoints (denoted as **SAM 3.1**) are released on [Hugging Face](https://huggingface.co/facebook/sam3.1). See [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md) for full details.
+  * To use the new SAM 3.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
+
 ## Installation
 
-Same as upstream (Python ≥ 3.12, PyTorch ≥ 2.7, CUDA ≥ 12.6):
+Following upstream (Python ≥ 3.12, recent PyTorch + CUDA):
 
 ```bash
 conda create -n sam3 python=3.12 && conda activate sam3
-pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+git clone https://github.com/serycjon/sam3.git
+cd sam3
 pip install -e .
+```
+
+Optional dependencies for faster inference:
+
+```bash
+pip install einops ninja && pip install flash-attn-3 --no-deps --index-url https://download.pytorch.org/whl/cu128
+pip install git+https://github.com/ronghanghu/cc_torch.git
 ```
 
 ⚠️ Request access to the checkpoints on the SAM 3 Hugging Face
 [repo](https://huggingface.co/facebook/sam3) and authenticate
 (`hf auth login`) before first use — the model is downloaded from there on the
-first `SAM3StreamingTracker()` construction.
+first `SAM3StreamingTracker()` construction. To use the **SAM 3.1** checkpoints
+see the upstream [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md).
 
 ---
 
