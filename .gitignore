@@ -153,3 +153,6 @@ Thumbs.db
 *.vocab
 
 /streaming_demo_out
+
+# scratch analysis notes (not tracked)
+TERNARY_MASK_ANALYSIS.md
