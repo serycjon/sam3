@@ -1,6 +1,7 @@
 import os
 import glob
 import time
+import argparse
 from pathlib import Path
 
 import tqdm
@@ -70,6 +71,19 @@ def repeat_first(gen):
     while True:
         yield item
 
+# Correction sanity-check parameters.
+# We aim for a correction roughly every TARGET frames, but pick the actual
+# interval at runtime so it does not cleanly divide the input length (see
+# pick_correction_interval).
+TARGET_INTERVAL = 100
+# How much the shift magnitude grows on every correction (in pixels).
+SHIFT_STEP = 3
+# Seed for the per-correction random shift direction (fixed for repeatability).
+SHIFT_SEED = 0
+# Cap the shift magnitude at this fraction of the smaller image dimension, so the
+# corrupted mask usually stays at least partly inside the frame.
+SHIFT_CAP_FRAC = 0.5
+
 def count_frames(video_path):
     """Number of frames in the input (an .mp4 file or a directory of .jpg)."""
     if isinstance(video_path, str) and video_path.endswith(".mp4"):
@@ -104,7 +118,46 @@ def cpu_rss_mb():
 
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
-def main():
+def pick_correction_interval(length, target=TARGET_INTERVAL):
+    """
+    Pick a correction interval close to ``target`` that does not evenly divide
+    ``length`` (so a correction never lands on the same phase every cycle, even
+    for adversarial lengths like a multiple of the target).
+
+    Searches outward from ``target`` (target, target-1, target+1, ...) and
+    returns the first candidate that leaves a non-zero remainder.
+    """
+    if length <= 0:
+        return target
+    for delta in range(0, target):
+        for cand in (target - delta, target + delta):
+            if cand > 1 and length % cand != 0:
+                return cand
+    return target  # pathological fallback (e.g. length == 1)
+
+def shift_mask(mask, dy, dx):
+    """
+    Translate a boolean mask by (dy, dx) pixels, filling exposed border with False.
+
+    Args:
+        mask: HxW boolean numpy array.
+        dy: vertical shift in pixels (positive moves the mask down).
+        dx: horizontal shift in pixels (positive moves the mask right).
+
+    Returns:
+        Shifted HxW boolean numpy array (no wraparound).
+    """
+    out = np.zeros_like(mask)
+    h, w = mask.shape
+    # Source/destination slice bounds for each axis given the (possibly negative) shift.
+    src_y = slice(max(0, -dy), h - max(0, dy))
+    dst_y = slice(max(0, dy), h - max(0, -dy))
+    src_x = slice(max(0, -dx), w - max(0, dx))
+    dst_x = slice(max(0, dx), w - max(0, -dx))
+    out[dst_y, dst_x] = mask[src_y, src_x]
+    return out
+
+def main(correct_self=False, correct_shift=False):
     data_dir = Path(__file__).parent.parent / 'assets' / 'videos'
     video_path = data_dir / "0001"
     annot_path = data_dir / "0001_init_mask.png"
@@ -115,7 +168,20 @@ def main():
 
     tracker = SAM3StreamingTracker()
 
+    # Pick a correction interval near TARGET_INTERVAL that does not cleanly
+    # divide the input length, so corrections do not lock onto one phase.
     n_frames = count_frames(video_path)
+    correction_interval = pick_correction_interval(n_frames)
+    if correct_self or correct_shift:
+        print(
+            f"{n_frames} input frames; correcting every {correction_interval} frames"
+        )
+
+    # Number of corrections applied so far; the shift magnitude grows as
+    # N * SHIFT_STEP pixels (capped) for the --correct-shift sanity check.
+    n_corrections = 0
+    # Seeded RNG so the random shift directions are repeatable across runs.
+    shift_rng = np.random.default_rng(SHIFT_SEED)
 
     # Resource instrumentation: per-frame tracker latency (for FPS) plus periodic
     # GPU/CPU memory samples, so we can confirm the streaming tracker stays flat.
@@ -123,16 +189,35 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     track_times = []  # seconds spent in the tracker per non-init frame
     mem_samples = []  # (frame_idx, gpu_alloc_mb, cpu_rss_mb) sampled over the run
-    sample_every = 100
+    sample_every = max(1, correction_interval)
 
     def sync():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    # Burn-in: ignore the first forward pass for the flat/growing verdict. During
-    # that pass the recent-memory bank fills up and the GPU/CPU footprint legitimately
-    # ramps; only after it do we expect the streaming footprint to plateau.
+    # Burn-in: ignore the warm-up phase for the flat/growing verdict. Two things
+    # ramp legitimately before the footprint plateaus:
+    #   1. the first forward pass fills the recent-memory bank (~n_frames);
+    #   2. corrections accumulate conditioning frames until eviction kicks in. The
+    #      tracker keeps at most max_cond_frames_in_attn corrections, and one lands
+    #      every correction_interval frames, so eviction only starts steady-state
+    #      after ~(N + 1) corrections.
     burn_in_frames = max(0, n_frames)
+    if correct_self or correct_shift:
+        n_kept = tracker.predictor.max_cond_frames_in_attn
+        if n_kept == -1:
+            # Unbounded attention: corrections are never evicted, so the footprint
+            # has no plateau to find. Use the whole run as warm-up (verdict -> n/a).
+            burn_in_frames = max(burn_in_frames, 51000)
+            print(
+                "warning: max_cond_frames_in_attn == -1 (corrections never evicted); "
+                "memory is expected to grow, flat/growing verdict not meaningful"
+            )
+        else:
+            corrections_to_saturate = n_kept + 1
+            burn_in_frames = max(
+                burn_in_frames, corrections_to_saturate * correction_interval
+            )
 
     try:
         for frame_idx, frame in tqdm.tqdm(enumerate(forward_backward(load_frames(video_path)))):
@@ -148,8 +233,35 @@ def main():
             if frame_idx > 0:
                 track_times.append(time.perf_counter() - t0)
 
+            # Periodically feed a correction back into the tracker as a sanity check.
+            is_correction_frame = (
+                (correct_self or correct_shift)
+                and frame_idx > 0
+                and frame_idx % correction_interval == 0
+            )
+            if is_correction_frame:
+                if correct_shift:
+                    # Take the current frame's tracker output and deliberately corrupt
+                    # it by shifting it in a random (seeded) direction. The magnitude
+                    # grows N * SHIFT_STEP pixels each correction but is capped near half
+                    # the image so the mask usually stays partly in frame. The shifted
+                    # mask is fed as the "correction" and shown as the demo output.
+                    n_corrections += 1
+                    h, w = mask.shape
+                    max_shift = int(min(h, w) * SHIFT_CAP_FRAC)
+                    magnitude = min(n_corrections * SHIFT_STEP, max_shift)
+                    angle = shift_rng.uniform(0.0, 2.0 * np.pi)
+                    dy = int(round(magnitude * np.sin(angle)))
+                    dx = int(round(magnitude * np.cos(angle)))
+                    mask = shift_mask(mask, dy, dx)
+                # --correct-self feeds the unmodified SAM mask straight back.
+                tracker.correct(frame, mask)
+
             vis = frame.copy()
-            vis[mask, 2] = 255
+            # Tint corrected frames green and normal tracked frames red (BGR), so
+            # it is obvious at a glance which frames a correction was applied to.
+            tint_channel = 1 if is_correction_frame else 2
+            vis[mask, tint_channel] = 255
 
             out_path = out_dir / f'{frame_idx:05d}.jpg'
             cv2.imwrite(str(out_path), vis)
@@ -231,6 +343,28 @@ def _print_report(track_times, mem_samples, burn_in_frames=0):
     print("=====================================")
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="SAM3 streaming demo")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--correct-self",
+        action="store_true",
+        help=(
+            f"Every ~{TARGET_INTERVAL} frames, feed the current SAM mask back as "
+            "a correction (sanity check: should be a no-op)."
+        ),
+    )
+    group.add_argument(
+        "--correct-shift",
+        action="store_true",
+        help=(
+            f"Every ~{TARGET_INTERVAL} frames, feed a deliberately shifted mask as "
+            f"the correction and demo output: a seeded random direction with magnitude "
+            f"growing {SHIFT_STEP}px each time, capped near half the image (sanity "
+            "check: tracker should follow the corruption)."
+        ),
+    )
+    args = parser.parse_args()
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
 
@@ -242,4 +376,4 @@ if __name__ == '__main__':
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-    main()
+    main(correct_self=args.correct_self, correct_shift=args.correct_shift)

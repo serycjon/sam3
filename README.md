@@ -132,6 +132,12 @@ forward-backward cycling video and writes overlay frames to `streaming_demo_out/
 python examples/demo.py
 ```
 
+Two flags inject periodic corrections as sanity checks (corrected frames are
+tinted green in the overlay): `--correct-self` feeds the tracker's own mask back
+unchanged (expected to be a no-op), and `--correct-shift` feeds a deliberately
+shifted mask of growing offset (the tracker should follow the corruption). The
+demo also prints an FPS / GPU / CPU memory report at the end.
+
 ---
 
 ## How it works
