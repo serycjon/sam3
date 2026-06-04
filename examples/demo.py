@@ -255,7 +255,7 @@ def main(correct_self=False, correct_shift=False):
                     dx = int(round(magnitude * np.cos(angle)))
                     mask = shift_mask(mask, dy, dx)
                 # --correct-self feeds the unmodified SAM mask straight back.
-                tracker.correct(frame, mask)
+                tracker.correct(mask)
 
             vis = frame.copy()
             # Tint corrected frames green and normal tracked frames red (BGR), so

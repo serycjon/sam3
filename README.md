@@ -77,7 +77,7 @@ authoritative conditioning and subsequent frames use it as memory:
 mask = tracker.track(frame)
 if user_sees_a_problem:
     corrected = annotate(frame)        # HxW bool, your own UI / tool
-    tracker.correct(frame, corrected)
+    tracker.correct(corrected)         # reuses the frame just tracked
 mask = tracker.track(next_frame)
 ```
 

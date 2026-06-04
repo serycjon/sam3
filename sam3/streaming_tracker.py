@@ -73,6 +73,9 @@ class SAM3StreamingTracker:
         self.accumulate_corrections = accumulate_corrections
         self.clear_recent_memory_on_correct = clear_recent_memory_on_correct
         self.inference_state = None
+        # Latest frame seen by init()/track(), kept so correct() can reuse it
+        # without the caller passing the frame in again (one frame, no growth).
+        self._last_frame = None
 
     def init(self, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
@@ -95,16 +98,17 @@ class SAM3StreamingTracker:
             num_frames=DUMMY_N_FRAMES,
         )
         self.frame_idx = 0
-        
+        self._last_frame = frame.copy()
+
         # Clear any previous state
         self.predictor.clear_all_points_in_video(self.inference_state)
-        
+
         # Add the initial mask
         self.predictor.add_new_mask_direct(
             inference_state=self.inference_state,
             frame_idx=self.frame_idx,
             obj_id=self.obj_id,
-            frame=frame.copy(),
+            frame=self._last_frame,
             mask=torch.from_numpy(mask.copy()),
         )
         
@@ -125,11 +129,11 @@ class SAM3StreamingTracker:
             True/1 indicates the object, False/0 indicates background
         """
         self.frame_idx += 1
-        
+        self._last_frame = frame.copy()
 
         # Run tracking on this frame
         sam_outputs = self.predictor.propagate_in_video_single(
-            self.inference_state, frame.copy(), self.frame_idx
+            self.inference_state, self._last_frame, self.frame_idx
         )
         frame_idx, object_ids, low_res_mask, video_res_mask, obj_scores = sam_outputs
 
@@ -148,34 +152,36 @@ class SAM3StreamingTracker:
 
         return mask
 
-    def correct(self, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    def correct(self, mask: np.ndarray) -> np.ndarray:
         """
         Correct the segmentation on the current (most recently tracked) frame.
 
         The user supplies a hand-annotated corrected mask for the frame that was
-        just returned by ``track()``. The mask is added as an authoritative
-        conditioning frame at ``self.frame_idx`` so that all subsequent tracking
-        uses it as memory. This mirrors the first-frame ``init()`` path
-        (``add_new_mask_direct`` + ``propagate_in_video_preflight``), applied at the
-        current frame instead of frame 0.
+        just returned by ``track()`` (or by ``init()``). The frame itself does not
+        need to be passed again: the tracker reuses the latest frame it saw, which
+        guarantees the correction lands on exactly the frame that produced the mask
+        being corrected. The mask is added as an authoritative conditioning frame at
+        ``self.frame_idx`` so that all subsequent tracking uses it as memory. This
+        mirrors the first-frame ``init()`` path (``add_new_mask_direct`` +
+        ``propagate_in_video_preflight``), applied at the current frame instead of
+        frame 0.
 
         Args:
-            frame: OpenCV frame (HxWx3 numpy array in uint8 BGR format) for the
-                current frame being corrected.
             mask: Corrected binary segmentation mask (HxW boolean numpy array).
 
         Returns:
             The input mask (passed through for convenience).
         """
-        if self.inference_state is None:
+        if self.inference_state is None or self._last_frame is None:
             raise RuntimeError("correct() called before init(); initialize tracking first")
 
-        # Add the corrected mask as a conditioning frame (memory encoder deferred).
+        # Add the corrected mask as a conditioning frame (memory encoder deferred),
+        # reusing the most recently tracked frame.
         self.predictor.add_new_mask_direct(
             inference_state=self.inference_state,
             frame_idx=self.frame_idx,
             obj_id=self.obj_id,
-            frame=frame.copy(),
+            frame=self._last_frame,
             mask=torch.from_numpy(mask.copy()),
         )
         # Consolidate and run the memory encoder (only on this new frame). This also
