@@ -1,51 +1,22 @@
 # SAM 3 — Streaming API fork
 
-A patched fork of Meta's **SAM 3: Segment Anything with Concepts** that adds a
-small, high-level **streaming single-object tracking API** on top of the original
-model, plus the ability to **correct the segmentation mid-stream**.
-
-- Upstream project: <https://github.com/facebookresearch/sam3>
-- Upstream paper / model / benchmarks: see the original repo above (this README
-  intentionally omits the upstream results tables, model card and author list —
-  refer to upstream for those).
-
-Streaming additions by **Jonas Serych**. Everything under `sam3/model/` is the
-upstream model; the streaming layer is a thin wrapper around it.
-
----
-
-## What this fork adds
+A fork of Meta's SAM 3 (Segment Anything with Concepts) that adds a small,
+high-level streaming single-object tracking API on top of the original model,
+plus the ability to correct the segmentation mid-stream.
 
 Upstream SAM 3 tracks video through an offline-style predictor that expects the
-whole clip up front (or a session against a fixed resource) and propagates across
-a known frame range. This fork adds **`sam3.SAM3StreamingTracker`** — a minimal
-`init → track → track → …` interface designed for:
-
-- **Live / unbounded streams** — frames arrive one at a time; nothing is buffered
-  ahead of time.
-- **Long videos** — memory is trimmed continuously so cost stays bounded instead
-  of growing with video length.
-- **Single-object mask tracking** — initialize from a binary mask, get a binary
-  mask per frame.
-- **Mid-stream correction** — when tracking drifts, hand a corrected mask back to
-  the tracker and it becomes authoritative conditioning going forward, without
-  restarting the session.
+whole clip up front. This fork adds `sam3.SAM3StreamingTracker`, an
+`init → track → track → …` interface for live or unbounded streams where frames
+arrive one at a time, memory stays bounded on long videos, and a corrected mask
+can be fed back mid-stream to become authoritative conditioning going forward.
 
 The streaming layer lives in [`sam3/streaming_tracker.py`](sam3/streaming_tracker.py)
-and is exported as `from sam3 import SAM3StreamingTracker`. It is supported by a
-few additions to the upstream tracker predictor
-([`sam3/model/sam3_tracking_predictor.py`](sam3/model/sam3_tracking_predictor.py)),
-namely `add_new_mask_direct` and `propagate_in_video_single` (frame-at-a-time
-variants of the upstream batched methods).
+and is exported as `from sam3 import SAM3StreamingTracker`. Everything under
+`sam3/model/` is the upstream model; see the
+[upstream repo](https://github.com/facebookresearch/sam3) for the paper, model
+card, benchmarks, and the SAM 3.1 checkpoints.
 
----
-
-## Latest updates
-
-**03/27/2026 -- SAM 3.1 Object Multiplex is released. It introduces a shared-memory approach for joint multi-object tracking that is significantly faster without sacrificing accuracy.**
-
-- A new suite of improved model checkpoints (denoted as **SAM 3.1**) are released on [Hugging Face](https://huggingface.co/facebook/sam3.1). See [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md) for full details.
-  * To use the new SAM 3.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
+Streaming additions by Jonas Serych.
 
 ## Installation
 
@@ -59,20 +30,25 @@ cd sam3
 pip install -e .
 ```
 
-Optional dependencies for faster inference:
+Request access to the checkpoints on the SAM 3 Hugging Face
+[repo](https://huggingface.co/facebook/sam3) and authenticate (`hf auth login`)
+before first use — the model is downloaded on the first `SAM3StreamingTracker()`
+construction.
+
+## Demo
+
+[`examples/demo.py`](examples/demo.py) runs the streaming tracker on a
+forward-backward cycling video and writes overlay frames to `streaming_demo_out/`:
 
 ```bash
-pip install einops ninja && pip install flash-attn-3 --no-deps --index-url https://download.pytorch.org/whl/cu128
-pip install git+https://github.com/ronghanghu/cc_torch.git
+python examples/demo.py
 ```
 
-⚠️ Request access to the checkpoints on the SAM 3 Hugging Face
-[repo](https://huggingface.co/facebook/sam3) and authenticate
-(`hf auth login`) before first use — the model is downloaded from there on the
-first `SAM3StreamingTracker()` construction. To use the **SAM 3.1** checkpoints
-see the upstream [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md).
-
----
+Two flags inject periodic corrections as sanity checks (corrected frames are
+tinted green in the overlay): `--correct-self` feeds the tracker's own mask back
+unchanged (expected to be a no-op), and `--correct-shift` feeds a deliberately
+shifted mask of growing offset (the tracker should follow the corruption). The
+demo also prints an FPS / GPU / CPU memory report at the end.
 
 ## Usage
 
@@ -93,19 +69,20 @@ for frame in stream:                 # frames as they arrive
     # ... use mask ...
 ```
 
-### Correcting drift mid-stream
-
-When the returned mask is wrong, hand-annotate a corrected mask for the **current**
-frame (the one most recently returned by `track()`) and feed it back:
+When the returned mask is wrong, hand-annotate a corrected mask for the current
+frame (the one most recently returned by `track()`) and feed it back. It becomes
+authoritative conditioning and subsequent frames use it as memory:
 
 ```python
 mask = tracker.track(frame)
 if user_sees_a_problem:
-    corrected = annotate(frame)      # HxW bool, your own UI / tool
-    tracker.correct(frame, corrected)  # becomes authoritative conditioning
-# continue tracking; subsequent frames use the correction as memory
+    corrected = annotate(frame)        # HxW bool, your own UI / tool
+    tracker.correct(frame, corrected)
 mask = tracker.track(next_frame)
 ```
+
+The tracker is single-object (`obj_id = 1`). Frames are OpenCV `HxWx3 uint8 BGR`
+arrays; masks are `HxW` booleans.
 
 ### Constructor options
 
@@ -119,118 +96,47 @@ SAM3StreamingTracker(
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `keep_first_cond_frame` | `True` | Always keep the first-frame annotation among the conditioning frames attended to, so tracking can't drift away from the original object identity. (Upstream model default is `False`.) |
-| `accumulate_corrections` | `False` | If `False`, conditioning frames that can never be re-selected for attention again are evicted to free GPU memory (see below). If `True`, every correction is kept forever. |
-| `clear_recent_memory_on_correct` | `False` | If `True`, drop recent non-conditioning memory around a correction so tracking leans on the corrected frame. Default keeps recent temporal history and lets the (conditioning) corrected frame dominate. Turn on when an error persisted for many frames before being corrected. |
-
-### Demo
-
-[`examples/demo.py`](examples/demo.py) runs the streaming tracker on a
-forward-backward cycling video and writes overlay frames to `streaming_demo_out/`:
-
-```bash
-python examples/demo.py
-```
-
-Two flags inject periodic corrections as sanity checks (corrected frames are
-tinted green in the overlay): `--correct-self` feeds the tracker's own mask back
-unchanged (expected to be a no-op), and `--correct-shift` feeds a deliberately
-shifted mask of growing offset (the tracker should follow the corruption). The
-demo also prints an FPS / GPU / CPU memory report at the end.
-
----
+| `keep_first_cond_frame` | `True` | Always keep the first-frame annotation among the conditioning frames attended to, so tracking can't drift away from the original object. (Upstream default is `False`.) |
+| `accumulate_corrections` | `False` | If `False`, conditioning frames that can never be re-selected for attention are evicted to free GPU memory. If `True`, every correction is kept forever. |
+| `clear_recent_memory_on_correct` | `False` | If `True`, drop recent non-conditioning memory around a correction so tracking leans on the corrected frame. Turn on when an error persisted for many frames before being corrected. |
 
 ## How it works
 
 The streaming tracker is a thin orchestration layer over the upstream tracker
-predictor. The full implementation is ~160 lines in
-[`sam3/streaming_tracker.py`](sam3/streaming_tracker.py).
+predictor. Two things make a frame-at-a-time stream work:
 
-### Initialization (`init`)
-1. `init_state(...)` with a small **dummy frame count** (the upstream video model
-   expects a frame count up front; the streaming tracker doesn't know the true
-   length, so it passes a placeholder).
-2. `add_new_mask_direct(frame_idx=0, mask=...)` — adds the first-frame mask as a
-   **conditioning frame**. The `_direct` variant takes the raw frame and computes
-   image features on the fly (the offline path expects frames to be pre-loaded
-   into the inference state).
-3. `propagate_in_video_preflight(...)` — consolidates the prompt and runs the
-   **memory encoder** on the first frame. (Upstream defers the memory encoder out
-   of `add_new_mask*` so non-overlap constraints can be applied across objects
-   first; preflight is where it actually runs.)
+- `_direct` variants of the predictor methods (`add_new_mask_direct`,
+  `propagate_in_video_single`) take the raw image for the current frame and
+  compute its features on the fly, instead of indexing into a clip of frames
+  pre-loaded into the inference state as the offline path expects. `init` and
+  `correct` are both the same prompt path (`add_new_mask_direct` +
+  `propagate_in_video_preflight`), applied at frame 0 and at the current frame
+  respectively.
 
-### Per frame (`track`)
-- `propagate_in_video_single(frame, frame_idx)` — a frame-at-a-time version of
-  upstream's `propagate_in_video` loop: it computes features for the new frame,
-  conditions on the memory bank, predicts the mask, and encodes the result into
-  memory.
-- After each frame, `_trim_memory(...)` deletes non-conditioning memory the
-  tracker's own memory-selection logic would no longer pick, keeping memory
-  bounded on long streams. Conditioning frames are never trimmed.
-
-### Correction (`correct`)
-A correction is just the `init` prompt path applied at the **current** frame
-instead of frame 0:
-1. `add_new_mask_direct(frame_idx=self.frame_idx, mask=corrected)` adds the mask
-   as a conditioning frame.
-2. `propagate_in_video_preflight(...)` consolidates it and runs the memory encoder
-   **only on that new frame** (cheap). It also replaces the frame's previously
-   tracked output, so the corrected mask supersedes it.
-3. Stale conditioning frames are optionally evicted (see below).
-
-### Memory & conditioning frames — the bounded-storage story
-SAM 3's memory bank distinguishes:
-- **Non-conditioning memory** — recent tracked frames; bounded by `num_maskmem`
-  (7 in this build) via the temporal memory-selection logic, and trimmed each
-  frame by `_trim_memory`.
-- **Conditioning frames** — user-prompted frames (the initial mask and every
-  correction). At attention time the model only attends to the
-  `max_cond_frames_in_attn` (4 in this build) temporally-closest conditioning
-  frames, but it does **not** free the rest — they accumulate on the GPU.
-
-Because the stream only ever moves forward, a conditioning frame that drops out of
-the "closest 4" window can never re-enter it. With `accumulate_corrections=False`
-(default), the streaming tracker therefore **evicts** any conditioning frame that
-can no longer be selected, freeing its GPU memory. With `keep_first_cond_frame=True`
-the protected set is `{first frame} ∪ {the most-recent corrections}`; otherwise it
-is simply the most-recent conditioning frames.
-
-### Notes / technicalities
-- **Single object.** The tracker hardcodes `obj_id = 1`.
-- **Frame format.** Frames are OpenCV `HxWx3 uint8 BGR` arrays; masks are `HxW`
-  booleans.
-- **`correct()` targets the current frame only.** The streaming tracker keeps no
-  past frames, so corrections apply to the frame just returned by `track()`; the
-  caller passes that frame's image alongside the corrected mask.
-- **Mid-stream `propagate_in_video_preflight` is safe.** It is idempotent: it
-  consolidates and memory-encodes only the newly added correction frame, and its
-  internal bookkeeping assertions stay satisfied because the correction is added
-  to the input-frame set and the consolidated set together.
-- See [`TERNARY_MASK_ANALYSIS.md`](TERNARY_MASK_ANALYSIS.md) (untracked scratch
-  notes) for an analysis of whether a three-valued object/background/ignore
-  correction mask is feasible.
-
----
+- Bounded storage. Recent non-conditioning memory is trimmed every frame to what
+  the temporal memory-selection logic would still pick. Conditioning frames (the
+  initial mask and corrections) are never attended to beyond the closest
+  `max_cond_frames_in_attn`, and since the stream only moves forward, any
+  conditioning frame that drops out of that window can never re-enter it — so
+  with `accumulate_corrections=False` it is evicted to free GPU memory (keeping
+  the first frame when `keep_first_cond_frame=True`).
 
 ## Relationship to upstream
 
 This fork tracks `facebookresearch/sam3`. The upstream model code under
 `sam3/model/` is unmodified except for the streaming helpers
-(`add_new_mask_direct`, `propagate_in_video_single`) and minor build fixes. To pull
-upstream updates:
+(`add_new_mask_direct`, `propagate_in_video_single`) and minor build fixes:
 
 ```bash
 git remote add fb_upstream https://github.com/facebookresearch/sam3.git
 git fetch fb_upstream
 ```
 
----
-
 ## Note on authorship
 
-The streaming layer was written by hand, but from the **mid-stream correction
-commit** (`b272205d`) onward this repo is **partially vibecoded** — parts were
-produced with AI coding assistance. Review accordingly.
+The streaming layer was written by hand, but from the mid-stream correction
+commit (`b272205d`) onward this repo is partially vibecoded — parts were produced
+with AI coding assistance. Review accordingly.
 
 ## License
 
