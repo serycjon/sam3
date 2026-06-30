@@ -135,6 +135,46 @@ def pick_correction_interval(length, target=TARGET_INTERVAL):
                 return cand
     return target  # pathological fallback (e.g. length == 1)
 
+# Distinct BGR colors for rendering candidate masks in the --return-all-masks
+# overlay (the model predicts up to 3-4 candidates per frame).
+CANDIDATE_COLORS = [
+    (0, 0, 255),    # red
+    (0, 255, 0),    # green
+    (255, 0, 0),    # blue
+    (0, 255, 255),  # yellow
+]
+
+def overlay_candidates(vis, candidates, alpha=0.5):
+    """
+    Alpha-blend each candidate mask onto ``vis`` in a distinct color and draw a
+    legend with each candidate's predicted IoU. The best-IoU candidate (the one
+    the tracker actually outputs) is marked with a '*'.
+
+    Args:
+        vis: HxWx3 uint8 BGR image, modified in place and returned.
+        candidates: dict from ``tracker.track(..., return_all_masks=True)`` with
+            "masks" (M,H,W) bool and "ious" (M,) float arrays.
+        alpha: blend strength for the colored overlay.
+    """
+    masks = candidates["masks"]
+    ious = candidates["ious"]
+    if masks.shape[0] == 0:
+        return vis  # no candidates for this frame (e.g. object absent)
+    best = int(np.argmax(ious))
+    for i in range(masks.shape[0]):
+        color = np.array(CANDIDATE_COLORS[i % len(CANDIDATE_COLORS)], dtype=np.float32)
+        m = masks[i]
+        vis[m] = ((1.0 - alpha) * vis[m] + alpha * color).astype(np.uint8)
+    for i in range(masks.shape[0]):
+        color = CANDIDATE_COLORS[i % len(CANDIDATE_COLORS)]
+        marker = "*" if i == best else " "
+        text = f"{marker}cand {i}: IoU {ious[i]:.3f}"
+        cv2.putText(
+            vis, text, (10, 20 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX,
+            0.5, color, 1, cv2.LINE_AA,
+        )
+    return vis
+
 def shift_mask(mask, dy, dx):
     """
     Translate a boolean mask by (dy, dx) pixels, filling exposed border with False.
@@ -157,7 +197,7 @@ def shift_mask(mask, dy, dx):
     out[dst_y, dst_x] = mask[src_y, src_x]
     return out
 
-def main(correct_self=False, correct_shift=False):
+def main(correct_self=False, correct_shift=False, return_all_masks=False):
     data_dir = Path(__file__).parent.parent / 'assets' / 'videos'
     video_path = data_dir / "0001"
     annot_path = data_dir / "0001_init_mask.png"
@@ -223,9 +263,12 @@ def main(correct_self=False, correct_shift=False):
         for frame_idx, frame in tqdm.tqdm(enumerate(forward_backward(load_frames(video_path)))):
             sync()
             t0 = time.perf_counter()
+            candidates = None
             if frame_idx == 0:
                 mask = tracker.init(frame, init_mask)
                 initialized = True
+            elif return_all_masks:
+                mask, candidates = tracker.track(frame, return_all_masks=True)
             else:
                 mask = tracker.track(frame)
             sync()
@@ -258,10 +301,14 @@ def main(correct_self=False, correct_shift=False):
                 tracker.correct(mask)
 
             vis = frame.copy()
-            # Tint corrected frames green and normal tracked frames red (BGR), so
-            # it is obvious at a glance which frames a correction was applied to.
-            tint_channel = 1 if is_correction_frame else 2
-            vis[mask, tint_channel] = 255
+            if candidates is not None:
+                # Render every candidate mask in its own color (best one marked).
+                vis = overlay_candidates(vis, candidates)
+            else:
+                # Tint corrected frames green and normal tracked frames red (BGR), so
+                # it is obvious at a glance which frames a correction was applied to.
+                tint_channel = 1 if is_correction_frame else 2
+                vis[mask, tint_channel] = 255
 
             out_path = out_dir / f'{frame_idx:05d}.jpg'
             cv2.imwrite(str(out_path), vis)
@@ -363,6 +410,16 @@ if __name__ == '__main__':
             "check: tracker should follow the corruption)."
         ),
     )
+    parser.add_argument(
+        "--return-all-masks",
+        action="store_true",
+        help=(
+            "Render all of SAM's per-frame candidate masks (before best-mask "
+            "selection), each in a distinct color, with their predicted IoUs in a "
+            "legend (the best-IoU candidate, the tracker's actual output, is marked "
+            "'*')."
+        ),
+    )
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -376,4 +433,8 @@ if __name__ == '__main__':
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-    main(correct_self=args.correct_self, correct_shift=args.correct_shift)
+    main(
+        correct_self=args.correct_self,
+        correct_shift=args.correct_shift,
+        return_all_masks=args.return_all_masks,
+    )
