@@ -546,7 +546,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
 
-        current_out, _ = self._run_single_frame_inference_direct(
+        current_out, _, _ = self._run_single_frame_inference_direct(
             inference_state=inference_state,
             output_dict=obj_output_dict,  # run on the slice of a single object
             frame_idx=frame_idx,
@@ -930,22 +930,32 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
 
     @torch.inference_mode()
     def propagate_in_video_single(self, inference_state, frame_opencv, frame_idx,
-                                  run_mem_encoder=True):
+                                  run_mem_encoder=True, return_all_masks=False):
         """
         Propagate tracking to a single frame in streaming video.
-        
+
         This method processes one frame at a time, which is suitable for streaming
         video or long video sequences where loading all frames at once is not practical.
         This is used internally by SAM3StreamingTracker.
-        
+
         Args:
             inference_state: The inference state dictionary
             frame_opencv: OpenCV frame (HxWx3 numpy array in BGR format)
             frame_idx: The frame index to process
             run_mem_encoder: Whether to run the memory encoder (default: True)
-        
+            return_all_masks: If True, also return all candidate masks predicted for
+                this frame (before best-mask selection), resized to video resolution,
+                together with their predicted IoUs. Only available when the frame is
+                freshly tracked (not when revisiting an already-consolidated frame),
+                otherwise the candidate outputs are None.
+
         Returns:
-            Tuple of (frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores)
+            Tuple of (frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores,
+            all_masks_video_res, multimask_ious). The last two are None unless
+            `return_all_masks=True`. When present, `all_masks_video_res` is a
+            [num_objs, M, video_H, video_W] tensor of candidate mask logits and
+            `multimask_ious` is a [num_objs, M] tensor of their predicted IoUs (M is 3
+            when multimask output is active, else 1).
         """
         reverse = False
         output_dict = inference_state["output_dict"]
@@ -960,6 +970,9 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
         )
 
+        # Candidate (pre-selection) masks for the current frame; only populated when the
+        # frame is freshly tracked below (revisited/consolidated frames don't keep them).
+        extra_out = {}
         if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
             storage_key = "cond_frame_outputs"
             current_out = output_dict[storage_key][frame_idx]
@@ -976,7 +989,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             obj_scores = current_out["object_score_logits"]
         else:
             storage_key = "non_cond_frame_outputs"
-            current_out, pred_masks = self._run_single_frame_inference_direct(
+            current_out, pred_masks, extra_out = self._run_single_frame_inference_direct(
                 inference_state=inference_state,
                 output_dict=output_dict,
                 frame_idx=frame_idx,
@@ -987,6 +1000,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 mask_inputs=None,
                 reverse=reverse,
                 run_mem_encoder=run_mem_encoder,
+                return_all_masks=return_all_masks,
             )
             obj_scores = current_out["object_score_logits"]
             output_dict[storage_key][frame_idx] = current_out
@@ -1003,7 +1017,40 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             inference_state, pred_masks
         )
 
-        return frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores
+        all_masks_video_res = None
+        multimask_ious = None
+        if return_all_masks and "pred_low_res_multimasks" in extra_out:
+            # Resize the candidate masks the same way as the selected mask above: a
+            # single bilinear step from the low-res logits straight to video resolution.
+            # We deliberately skip the non-overlap / hole-filling done in
+            # `_get_orig_video_res_output`, since those treat dim 0 as distinct objects
+            # and would corrupt the per-object candidate channels here.
+            device = inference_state["device"]
+            video_H = inference_state["video_height"]
+            video_W = inference_state["video_width"]
+            low_res_multimasks = extra_out["pred_low_res_multimasks"].to(
+                device, non_blocking=True
+            )
+            if low_res_multimasks.shape[-2:] == (video_H, video_W):
+                all_masks_video_res = low_res_multimasks
+            else:
+                all_masks_video_res = torch.nn.functional.interpolate(
+                    low_res_multimasks,
+                    size=(video_H, video_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            multimask_ious = extra_out["multimask_ious"]
+
+        return (
+            frame_idx,
+            obj_ids,
+            low_res_masks,
+            video_res_masks,
+            obj_scores,
+            all_masks_video_res,
+            multimask_ious,
+        )
         
 
     @torch.inference_mode()
@@ -1322,6 +1369,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         run_mem_encoder,
         prev_sam_mask_logits=None,
         use_prev_mem_frame=True,
+        return_all_masks=False,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
         # Retrieve correct image features
@@ -1350,6 +1398,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             run_mem_encoder=run_mem_encoder,
             prev_sam_mask_logits=prev_sam_mask_logits,
             use_prev_mem_frame=use_prev_mem_frame,
+            return_all_masks=return_all_masks,
         )
 
         # optionally offload the output to CPU memory to save GPU space
@@ -1376,7 +1425,13 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         if self.use_memory_selection:
             compact_current_out["iou_score"] = current_out["iou_score"]
             compact_current_out["eff_iou_score"] = current_out["eff_iou_score"]
-        return compact_current_out, pred_masks_gpu
+        # All candidate masks for the current frame, threaded out *separately* from the
+        # compact (persisted) output so they are never stored in the memory bank.
+        extra_out = {}
+        if "pred_low_res_multimasks" in current_out:
+            extra_out["pred_low_res_multimasks"] = current_out["pred_low_res_multimasks"]
+            extra_out["multimask_ious"] = current_out["multimask_ious"]
+        return compact_current_out, pred_masks_gpu, extra_out
 
     def _run_single_frame_inference(
         self,

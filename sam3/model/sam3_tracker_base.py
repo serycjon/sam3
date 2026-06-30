@@ -948,6 +948,10 @@ class Sam3TrackerBase(torch.nn.Module):
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
         use_prev_mem_frame=True,
+        # If True, also stash all candidate masks (pre best-mask selection) for this
+        # frame into the returned dict under "pred_low_res_multimasks"/"multimask_ious".
+        # Opt-in so existing callers are unaffected and nothing extra is ever persisted.
+        return_all_masks=False,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -996,7 +1000,7 @@ class Sam3TrackerBase(torch.nn.Module):
                 multimask_output=multimask_output,
             )
         (
-            _,
+            low_res_multimasks,
             high_res_multimasks,
             ious,
             low_res_masks,
@@ -1008,6 +1012,16 @@ class Sam3TrackerBase(torch.nn.Module):
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["obj_ptr"] = obj_ptr
+        if return_all_masks:
+            # Expose all candidate masks (not just the selected best) for the current
+            # frame. These low-res multimask logits ([B, M, H/4, W/4]) and their
+            # predicted IoUs ([B, M]) are kept here only so a caller can inspect the
+            # current frame. The caller (`_run_single_frame_inference_direct`) copies
+            # them out separately and the compact per-frame output stored in the memory
+            # bank omits them, so they are never persisted/cached. M is 3 when multimask
+            # output is active, else 1.
+            current_out["pred_low_res_multimasks"] = low_res_multimasks
+            current_out["multimask_ious"] = ious
         if self.use_memory_selection:
             current_out["object_score_logits"] = object_score_logits
             iou_score = ious.max(-1)[0]
@@ -1059,6 +1073,14 @@ class Sam3TrackerBase(torch.nn.Module):
             if self.use_memory_selection:
                 trimmed_out["iou_score"] = current_out["iou_score"].cpu()
                 trimmed_out["eff_iou_score"] = current_out["eff_iou_score"].cpu()
+            if return_all_masks:
+                # Carry the current-frame candidates through the offload trimming too
+                # (offloaded to CPU like the other masks). They are still consumed and
+                # dropped per-frame by the caller, so nothing accumulates.
+                trimmed_out["pred_low_res_multimasks"] = current_out[
+                    "pred_low_res_multimasks"
+                ].cpu()
+                trimmed_out["multimask_ious"] = current_out["multimask_ious"].cpu()
             current_out = trimmed_out
 
         # Optionally, trim the output of past non-conditioning frame (r * num_maskmem frames

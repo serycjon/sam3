@@ -117,30 +117,46 @@ class SAM3StreamingTracker:
 
         return mask
 
-    def track(self, frame: np.ndarray) -> np.ndarray:
+    def track(self, frame: np.ndarray, return_all_masks: bool = False):
         """
         Track the object in the next frame.
-        
+
         Args:
             frame: OpenCV frame (HxWx3 numpy array in uint8 BGR format)
-        
+            return_all_masks: If True, also return the model's candidate masks for this
+                frame (before best-mask selection) and their predicted IoUs.
+
         Returns:
-            Binary segmentation mask (HxW boolean numpy array)
-            True/1 indicates the object, False/0 indicates background
+            By default, the binary segmentation mask (HxW boolean numpy array; True/1
+            indicates the object, False/0 background).
+
+            If ``return_all_masks=True``, a tuple ``(mask, candidates)`` where
+            ``candidates`` is a dict with:
+              - ``"masks"``: boolean array of shape (M, H, W), the M candidate masks
+                for the tracked object thresholded at logit 0 (M is 3 when multimask
+                output is active, else 1);
+              - ``"logits"``: float32 array of shape (M, H, W), the raw mask logits;
+              - ``"ious"``: float32 array of shape (M,), the predicted IoU of each
+                candidate (the best of which is what the default mask uses).
+            These are computed for the current frame only and are not stored in memory.
         """
         self.frame_idx += 1
         self._last_frame = frame.copy()
 
         # Run tracking on this frame
         sam_outputs = self.predictor.propagate_in_video_single(
-            self.inference_state, self._last_frame, self.frame_idx
+            self.inference_state, self._last_frame, self.frame_idx,
+            return_all_masks=return_all_masks,
         )
-        frame_idx, object_ids, low_res_mask, video_res_mask, obj_scores = sam_outputs
+        (frame_idx, object_ids, low_res_mask, video_res_mask, obj_scores,
+         all_masks_video_res, multimask_ious) = sam_outputs
 
         # Extract mask for our tracked object
         out_mask = np.zeros(video_res_mask[0].shape[1:], dtype=np.uint8) > 0
+        obj_index = None
         for i_oid, oid in enumerate(object_ids):
             if oid == self.obj_id:
+                obj_index = i_oid
                 mask_logit = video_res_mask[i_oid]
                 mask = (einops.rearrange(mask_logit, "1 H W -> H W") > 0).cpu().numpy()
                 out_mask = np.logical_or(out_mask, mask)
@@ -150,7 +166,30 @@ class SAM3StreamingTracker:
         # Trim old frames from memory to prevent unbounded growth
         _trim_memory(self.predictor, frame_idx, self.inference_state["output_dict"])
 
+        if return_all_masks:
+            candidates = self._extract_candidates(
+                all_masks_video_res, multimask_ious, obj_index
+            )
+            return mask, candidates
+
         return mask
+
+    def _extract_candidates(self, all_masks_video_res, multimask_ious, obj_index):
+        """Build the per-candidate dict for the tracked object (see ``track``)."""
+        if all_masks_video_res is None or obj_index is None:
+            # No freshly-tracked candidates available for this frame/object.
+            return {
+                "masks": np.empty((0, 0, 0), dtype=bool),
+                "logits": np.empty((0, 0, 0), dtype=np.float32),
+                "ious": np.empty((0,), dtype=np.float32),
+            }
+        logits = all_masks_video_res[obj_index].float().cpu().numpy()  # (M, H, W)
+        ious = multimask_ious[obj_index].float().cpu().numpy()  # (M,)
+        return {
+            "masks": logits > 0,
+            "logits": logits,
+            "ious": ious,
+        }
 
     def correct(self, mask: np.ndarray) -> np.ndarray:
         """
