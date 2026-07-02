@@ -144,17 +144,22 @@ CANDIDATE_COLORS = [
     (0, 255, 255),  # yellow
 ]
 
-def overlay_candidates(vis, candidates, alpha=0.5):
+def overlay_candidates(vis, candidates, alpha=0.35, boundary_thickness=2):
     """
     Alpha-blend each candidate mask onto ``vis`` in a distinct color and draw a
     legend with each candidate's predicted IoU. The best-IoU candidate (the one
     the tracker actually outputs) is marked with a '*'.
 
+    The mask interior is lightly blended (so overlaps stay legible) while the
+    boundary is drawn opaque, giving each candidate a crisp, unambiguous outline
+    even where several candidates overlap.
+
     Args:
         vis: HxWx3 uint8 BGR image, modified in place and returned.
         candidates: dict from ``tracker.track(..., return_all_masks=True)`` with
             "masks" (M,H,W) bool and "ious" (M,) float arrays.
-        alpha: blend strength for the colored overlay.
+        alpha: blend strength for the translucent mask interior.
+        boundary_thickness: line thickness (px) of the opaque mask outline.
     """
     masks = candidates["masks"]
     ious = candidates["ious"]
@@ -165,6 +170,14 @@ def overlay_candidates(vis, candidates, alpha=0.5):
         color = np.array(CANDIDATE_COLORS[i % len(CANDIDATE_COLORS)], dtype=np.float32)
         m = masks[i]
         vis[m] = ((1.0 - alpha) * vis[m] + alpha * color).astype(np.uint8)
+    # Draw opaque boundaries in a second pass so outlines are never dimmed by a
+    # translucent fill layered on top of them.
+    for i in range(masks.shape[0]):
+        color = CANDIDATE_COLORS[i % len(CANDIDATE_COLORS)]
+        contours, _ = cv2.findContours(
+            masks[i].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(vis, contours, -1, color, boundary_thickness, cv2.LINE_AA)
     for i in range(masks.shape[0]):
         color = CANDIDATE_COLORS[i % len(CANDIDATE_COLORS)]
         marker = "*" if i == best else " "
