@@ -89,8 +89,12 @@ class SAM3StreamingTracker:
         Returns:
             The input mask (passed through for convenience)
         """
-        # This is a workaround for the video model expecting a frame count
-        DUMMY_N_FRAMES = 13
+        # This is a workaround for the video model expecting a frame count.
+        # Must be >= max_obj_ptrs_in_encoder (16) so the object-pointer memory
+        # budget and the sine temporal-position-encoding normalizer match batch
+        # behavior, and must exceed any real stream length because num_frames also
+        # upper-bounds pointer lookups when memory selection is off.
+        DUMMY_N_FRAMES = 1_000_000_000
         
         self.inference_state = self.predictor.init_state(
             video_height=frame.shape[0],
