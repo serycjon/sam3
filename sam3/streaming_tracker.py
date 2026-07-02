@@ -108,9 +108,6 @@ class SAM3StreamingTracker:
         self.frame_idx = 0
         self._last_frame = frame.copy()
 
-        # Clear any previous state
-        self.predictor.clear_all_points_in_video(self.inference_state)
-
         # Add the initial mask
         self.predictor.add_new_mask_direct(
             inference_state=self.inference_state,
@@ -145,9 +142,14 @@ class SAM3StreamingTracker:
                 output is active, else 1);
               - ``"logits"``: float32 array of shape (M, H, W), the raw mask logits;
               - ``"ious"``: float32 array of shape (M,), the predicted IoU of each
-                candidate (the best of which is what the default mask uses).
+                candidate (the default mask is normally the highest-IoU candidate,
+                though the decoder may fall back to a more stable candidate via
+                dynamic_multimask_via_stability).
             These are computed for the current frame only and are not stored in memory.
         """
+        if self.inference_state is None:
+            raise RuntimeError("track() called before init(); initialize tracking first")
+
         self.frame_idx += 1
         self._last_frame = frame.copy()
 

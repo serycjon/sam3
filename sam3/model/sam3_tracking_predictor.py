@@ -993,7 +993,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 # clear non-conditioning memory of the surrounding frames
                 self._clear_non_cond_mem_around_input(inference_state, frame_idx)
         elif frame_idx in consolidated_frame_inds["non_cond_frame_outputs"]:
-            print('weird... revisiting old frame')
+            logging.warning("revisiting already-consolidated non-cond frame %d", frame_idx)
             storage_key = "non_cond_frame_outputs"
             current_out = output_dict[storage_key][frame_idx]
             pred_masks = current_out["pred_masks"]
