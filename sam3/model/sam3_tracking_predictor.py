@@ -195,6 +195,17 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         box=None,
     ):
         """Add new points to a frame."""
+        # Streaming inference states (marked by `SAM3StreamingTracker.init`) do not
+        # populate `frames_already_tracked` or `output_dict_per_obj` (see
+        # `propagate_in_video_single`), so clicks on an already-tracked frame would
+        # be treated as an *initial* conditioning frame and segmented without any
+        # memory context -- a silent quality regression. Only mask corrections
+        # (`add_new_mask_direct`), which bypass memory attention, are supported on
+        # streaming states.
+        assert not inference_state.get("streaming", False), (
+            "point/box prompts are not supported on streaming inference states; "
+            "use mask prompts (add_new_mask_direct) instead"
+        )
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
         point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]
         mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]

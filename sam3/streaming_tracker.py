@@ -101,6 +101,10 @@ class SAM3StreamingTracker:
             video_width=frame.shape[1],
             num_frames=DUMMY_N_FRAMES,
         )
+        # Mark the state as streaming: it never populates `frames_already_tracked`
+        # or `output_dict_per_obj` (see `propagate_in_video_single`), which only
+        # mask prompts tolerate. `add_new_points_or_box` refuses to run on it.
+        self.inference_state["streaming"] = True
         self.frame_idx = 0
         self._last_frame = frame.copy()
 
