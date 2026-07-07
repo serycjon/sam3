@@ -6,7 +6,8 @@ This module provides a high-level interface for single-object tracking in video 
 optimized for memory efficiency and suitable for long-running tracking tasks.
 """
 
-from typing import Any, Dict
+import json
+from typing import Any, Dict, List, Optional
 
 import einops
 import numpy as np
@@ -38,6 +39,7 @@ class SAM3StreamingTracker:
         keep_first_cond_frame: bool = True,
         accumulate_corrections: bool = False,
         clear_recent_memory_on_correct: bool = False,
+        debug: bool = False,
     ) -> None:
         """
         Initialize the streaming tracker with SAM3 model.
@@ -60,6 +62,12 @@ class SAM3StreamingTracker:
                 Default False: keep recent temporal history and let the corrected
                 conditioning frame dominate. Turn on when an error persisted for many
                 frames before being corrected.
+            debug: If True, append one compact JSON-serializable record per
+                ``init()``/``track()``/``correct()`` call to ``self.debug_log``,
+                describing the memory-attention roster actually used for the frame,
+                the frame's quality scores, and all memory-bank mutations (trims,
+                evictions). Pure Python scalars only (no tensors); see
+                ``save_debug_log`` for persisting it.
         """
         from sam3.model_builder import build_sam3_video_model
 
@@ -69,9 +77,27 @@ class SAM3StreamingTracker:
         predictor.keep_first_cond_frame = keep_first_cond_frame
 
         self.predictor = predictor
+        # Have the mask decoder stash the single-mask token's output (token 0),
+        # which the multimask tracking path otherwise discards; exposed via
+        # track(return_all_masks=True).
+        predictor.sam_mask_decoder.expose_token0_output = True
         self.obj_id = 1
         self.accumulate_corrections = accumulate_corrections
         self.clear_recent_memory_on_correct = clear_recent_memory_on_correct
+        self.debug = debug
+        predictor.mem_debug_enabled = debug
+        self.debug_log: List[Dict[str, Any]] = []
+        self.debug_config: Dict[str, Any] = {
+            "num_maskmem": predictor.num_maskmem,
+            "max_obj_ptrs_in_encoder": predictor.max_obj_ptrs_in_encoder,
+            "max_cond_frames_in_attn": predictor.max_cond_frames_in_attn,
+            "mf_threshold": predictor.mf_threshold,
+            "memory_temporal_stride_for_eval": predictor.memory_temporal_stride_for_eval,
+            "use_memory_selection": predictor.use_memory_selection,
+            "keep_first_cond_frame": keep_first_cond_frame,
+            "accumulate_corrections": accumulate_corrections,
+            "clear_recent_memory_on_correct": clear_recent_memory_on_correct,
+        }
         self.inference_state = None
         # Latest frame seen by init()/track(), kept so correct() can reuse it
         # without the caller passing the frame in again (one frame, no growth).
@@ -120,6 +146,8 @@ class SAM3StreamingTracker:
         # Prepare for tracking
         self.predictor.propagate_in_video_preflight(self.inference_state)
 
+        self._record_debug("init")
+
         return mask
 
     def track(self, frame: np.ndarray, return_all_masks: bool = False):
@@ -142,9 +170,17 @@ class SAM3StreamingTracker:
                 output is active, else 1);
               - ``"logits"``: float32 array of shape (M, H, W), the raw mask logits;
               - ``"ious"``: float32 array of shape (M,), the predicted IoU of each
-                candidate (the default mask is normally the highest-IoU candidate,
-                though the decoder may fall back to a more stable candidate via
-                dynamic_multimask_via_stability).
+                candidate (the default output mask is the highest-IoU candidate;
+                the decoder's dynamic_multimask_via_stability fallback only applies
+                when multimask output is off, so it never fires during tracking);
+              - ``"token0_logits"`` / ``"token0_mask"``: float32 / bool arrays of
+                shape (H, W), the single-mask token's output — what the decoder
+                would base its output on when multimask is off. Computed on every
+                frame but normally discarded; raw logits, without the no-object
+                masking applied to the candidates;
+              - ``"token0_iou"`` / ``"token0_stability"``: floats, the predicted IoU
+                and the stability score of the single-mask token's output.
+                The token0 keys are absent when the frame was not freshly tracked.
             These are computed for the current frame only and are not stored in memory.
         """
         if self.inference_state is None:
@@ -152,6 +188,15 @@ class SAM3StreamingTracker:
 
         self.frame_idx += 1
         self._last_frame = frame.copy()
+
+        if self.debug:
+            # Cleared here (in addition to the reset inside the conditioning code) so
+            # a revisited already-consolidated frame, which skips inference entirely,
+            # cannot report the previous frame's attention roster.
+            self.predictor.last_mem_debug = None
+        # Same staleness guard for the single-mask-token stash (only written when the
+        # frame is freshly tracked through the mask decoder).
+        self.predictor.sam_mask_decoder.last_token0_out = None
 
         # Run tracking on this frame
         sam_outputs = self.predictor.propagate_in_video_single(
@@ -174,7 +219,11 @@ class SAM3StreamingTracker:
         mask = out_mask
 
         # Trim old frames from memory to prevent unbounded growth
-        _trim_memory(self.predictor, frame_idx, self.inference_state["output_dict"])
+        trimmed = _trim_memory(
+            self.predictor, frame_idx, self.inference_state["output_dict"]
+        )
+
+        self._record_debug("track", trimmed=trimmed)
 
         if return_all_masks:
             candidates = self._extract_candidates(
@@ -195,11 +244,34 @@ class SAM3StreamingTracker:
             }
         logits = all_masks_video_res[obj_index].float().cpu().numpy()  # (M, H, W)
         ious = multimask_ious[obj_index].float().cpu().numpy()  # (M,)
-        return {
+        candidates = {
             "masks": logits > 0,
             "logits": logits,
             "ious": ious,
         }
+
+        # The single-mask token's output (token 0), stashed by the mask decoder on
+        # this frame's forward pass (see MaskDecoder.forward); consume and clear it.
+        token0 = getattr(self.predictor.sam_mask_decoder, "last_token0_out", None)
+        self.predictor.sam_mask_decoder.last_token0_out = None
+        if token0 is not None:
+            token0_low_res, token0_iou, token0_stability = token0
+            video_hw = (
+                self.inference_state["video_height"],
+                self.inference_state["video_width"],
+            )
+            token0_video_res = torch.nn.functional.interpolate(
+                token0_low_res[obj_index : obj_index + 1].float(),
+                size=video_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+            token0_logits = token0_video_res[0, 0].cpu().numpy()
+            candidates["token0_logits"] = token0_logits
+            candidates["token0_mask"] = token0_logits > 0
+            candidates["token0_iou"] = float(token0_iou[obj_index, 0])
+            candidates["token0_stability"] = float(token0_stability[obj_index, 0])
+        return candidates
 
     def correct(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -237,15 +309,19 @@ class SAM3StreamingTracker:
         # pops the prior tracked non-conditioning output for this frame.
         self.predictor.propagate_in_video_preflight(self.inference_state)
 
+        cleared: List[int] = []
         if self.clear_recent_memory_on_correct:
-            self._clear_consolidated_non_cond_around(self.frame_idx)
+            cleared = self._clear_consolidated_non_cond_around(self.frame_idx)
 
+        evicted: List[int] = []
         if not self.accumulate_corrections:
-            self._evict_stale_corrections()
+            evicted = self._evict_stale_corrections()
+
+        self._record_debug("correct", cleared=cleared, evicted=evicted)
 
         return mask
 
-    def _clear_consolidated_non_cond_around(self, frame_idx: int) -> None:
+    def _clear_consolidated_non_cond_around(self, frame_idx: int) -> List[int]:
         """
         Clear recent non-conditioning memory around a correction frame.
 
@@ -253,14 +329,20 @@ class SAM3StreamingTracker:
         per-object output dict, which the streaming path leaves empty (it stores
         tracked outputs directly in the consolidated ``output_dict``). So we clear the
         consolidated dict that memory selection actually reads from.
+
+        Returns:
+            The frame indices that were actually removed.
         """
         r = self.predictor.memory_temporal_stride_for_eval
         n = self.predictor.num_maskmem
         non_cond = self.inference_state["output_dict"]["non_cond_frame_outputs"]
+        cleared = []
         for t in range(frame_idx - r * n, frame_idx + r * n + 1):
-            non_cond.pop(t, None)
+            if non_cond.pop(t, None) is not None:
+                cleared.append(t)
+        return cleared
 
-    def _evict_stale_corrections(self) -> None:
+    def _evict_stale_corrections(self) -> List[int]:
         """
         Free conditioning frames that can never be selected for attention again.
 
@@ -269,16 +351,19 @@ class SAM3StreamingTracker:
         pinned first frame (when ``keep_first_cond_frame``) plus the most recent ones.
         Older corrections are unreachable forever, so we delete them (and their
         downgraded non-conditioning copies) to actually free GPU memory.
+
+        Returns:
+            The conditioning frame indices that were evicted.
         """
         N = self.predictor.max_cond_frames_in_attn
         if N == -1:
-            return  # unbounded attention; no conditioning frame is ever unreachable
+            return []  # unbounded attention; no conditioning frame is ever unreachable
 
         output_dict = self.inference_state["output_dict"]
         cond = output_dict["cond_frame_outputs"]
         ordered = sorted(cond.keys())
         if len(ordered) <= N:
-            return
+            return []
 
         if self.predictor.keep_first_cond_frame:
             protected = {ordered[0]}
@@ -287,6 +372,7 @@ class SAM3StreamingTracker:
         else:
             protected = set(ordered[-N:])
 
+        evicted = []
         for idx in ordered:
             if idx in protected:
                 continue
@@ -300,21 +386,117 @@ class SAM3StreamingTracker:
             output_dict["non_cond_frame_outputs"].pop(idx, None)
             for obj_output_dict in self.inference_state["output_dict_per_obj"].values():
                 obj_output_dict["non_cond_frame_outputs"].pop(idx, None)
+            evicted.append(idx)
+        return evicted
+
+    def _record_debug(
+        self,
+        event: str,
+        trimmed: Optional[List[int]] = None,
+        cleared: Optional[List[int]] = None,
+        evicted: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Append one debug record for the call that just finished (no-op unless
+        ``debug=True``).
+
+        All ``frame_idx`` values anywhere in the record are absolute stream indices:
+        the init frame is 0 and the k-th ``track()`` call is k ("correct" records
+        share the index of the last tracked frame).
+
+        Record schema (all plain Python scalars, JSON-serializable):
+          - ``event``: "init" | "track" | "correct".
+          - ``frame_idx``: the current frame.
+          - ``attention``: for "track" events, the memory roster actually attended
+            when computing this frame (``cond_selected``/``cond_unselected``,
+            ``valid_indices`` from ``frame_filter``, ``spatial_mem`` and ``obj_ptrs``
+            as lists of {frame_idx, t_pos/pos, is_cond}); None for "init"/"correct"
+            (mask-as-output, no memory read) and for revisited consolidated frames.
+            ``t_pos`` is the temporal attention slot (0 = cond frame — shared by all
+            cond frames — and 1..num_maskmem-1 for non-cond, num_maskmem-1 being the
+            most recent frame); slots slide by one every step. ``pos`` feeds the
+            pointer's sine temporal encoding: true frame distance for cond frames,
+            recency rank for non-cond. Both lists are ordered exactly as the memory
+            tokens are concatenated for cross-attention: each ``spatial_mem`` entry
+            spans one memory feature map's tokens, followed by the pointer block
+            where entry i occupies the (C // mem_dim) tokens starting at
+            i * (C // mem_dim).
+          - ``scores``: this frame's ``eff_iou_score`` / ``iou_score`` /
+            ``object_score_logits`` (None when the frame has no tracked output, e.g.
+            right after a correction consolidated it into a cond frame).
+          - ``trimmed`` / ``cleared`` / ``evicted_corrections``: frame indices whose
+            memory was deleted by this call.
+          - ``mem_state``: memory-bank contents after the call — ``cond`` frame
+            indices and ``non_cond_scores`` mapping frame index -> eff_iou_score.
+        """
+        if not self.debug:
+            return
+        output_dict = self.inference_state["output_dict"]
+        non_cond = output_dict["non_cond_frame_outputs"]
+
+        cur = non_cond.get(self.frame_idx)
+        scores = None
+        if cur is not None and "eff_iou_score" in cur:
+            scores = {
+                "eff_iou_score": float(cur["eff_iou_score"]),
+                "iou_score": float(cur["iou_score"].flatten()[0]),
+                "object_score_logits": float(cur["object_score_logits"].flatten()[0]),
+            }
+
+        attention = None
+        if event == "track":
+            attention = getattr(self.predictor, "last_mem_debug", None)
+
+        self.debug_log.append(
+            {
+                "event": event,
+                "frame_idx": self.frame_idx,
+                "attention": attention,
+                "scores": scores,
+                "trimmed": trimmed or [],
+                "cleared": cleared or [],
+                "evicted_corrections": evicted or [],
+                "mem_state": {
+                    "cond": sorted(
+                        int(t) for t in output_dict["cond_frame_outputs"]
+                    ),
+                    "non_cond_scores": {
+                        int(t): float(out["eff_iou_score"])
+                        for t, out in sorted(non_cond.items())
+                        if "eff_iou_score" in out
+                    },
+                },
+            }
+        )
+
+    def save_debug_log(self, path: str) -> None:
+        """
+        Save ``debug_config`` and the accumulated ``debug_log`` as JSON.
+
+        Note that JSON turns the integer keys of ``non_cond_scores`` into strings.
+        Callers doing periodic flushes on very long streams can clear
+        ``self.debug_log`` after saving.
+        """
+        with open(path, "w") as f:
+            json.dump({"config": self.debug_config, "log": self.debug_log}, f)
 
 
 def _trim_memory(
         tracker: Any, frame_idx: int, output_dict: Dict[str, Any]
-) -> None:
+) -> List[int]:
     """
     Trim old frames from memory to prevent unbounded growth in long videos.
-    
+
     This internal function removes frames that are no longer needed for tracking,
     keeping only the frames that the memory selection mechanism would retain.
-    
+
     Args:
         tracker: The SAM3 tracker predictor instance
         frame_idx: Current frame index
         output_dict: Output dictionary from inference_state containing frame outputs
+
+    Returns:
+        The frame indices that were removed from ``non_cond_frame_outputs``.
     """
     if not tracker.use_memory_selection:
         raise NotImplementedError(
@@ -333,9 +515,12 @@ def _trim_memory(
     )
 
     # Discard all other frames
+    trimmed = []
     for i in range(frame_idx - 1, 0, -memory_stride):
         if i not in selected_indices:
             # Delete only the non_cond_frame_outputs, keep the cond_ ones
             # (with direct user annotation)
             if i in output_dict["non_cond_frame_outputs"]:
                 del output_dict["non_cond_frame_outputs"][i]
+                trimmed.append(i)
+    return trimmed

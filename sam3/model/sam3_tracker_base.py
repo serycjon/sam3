@@ -579,6 +579,13 @@ class Sam3TrackerBase(torch.nn.Module):
             pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
             return pix_feat
 
+        # Debug channel (opt-in via `mem_debug_enabled`, used by SAM3StreamingTracker):
+        # reset every call so a caller can never read a stale roster from an earlier
+        # frame after a call that skips memory conditioning.
+        mem_debug = None
+        if getattr(self, "mem_debug_enabled", False):
+            self.last_mem_debug = None
+
         num_obj_ptr_tokens = 0
         tpos_sign_mul = -1 if track_in_reverse else 1
         # Step 1: condition the visual features of the current frame on previous memories
@@ -597,7 +604,7 @@ class Sam3TrackerBase(torch.nn.Module):
                 keep_first_cond_frame=self.keep_first_cond_frame,
             )
             t_pos_and_prevs = [
-                ((frame_idx - t) * tpos_sign_mul, out, True)
+                ((frame_idx - t) * tpos_sign_mul, out, True, t)
                 for t, out in selected_cond_outputs.items()
             ]
             # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
@@ -610,6 +617,21 @@ class Sam3TrackerBase(torch.nn.Module):
                 valid_indices = self.frame_filter(
                     output_dict, track_in_reverse, frame_idx, num_frames, r
                 )
+
+            if getattr(self, "mem_debug_enabled", False):
+                mem_debug = {
+                    "frame_idx": int(frame_idx),
+                    "cond_selected": sorted(int(t) for t in selected_cond_outputs),
+                    "cond_unselected": sorted(int(t) for t in unselected_cond_outputs),
+                    "valid_indices": (
+                        [int(i) for i in valid_indices]
+                        if self.use_memory_selection
+                        else None
+                    ),
+                    "spatial_mem": [],
+                    "obj_ptrs": [],
+                }
+                self.last_mem_debug = mem_debug
 
             for t_pos in range(1, self.num_maskmem):
                 t_rel = self.num_maskmem - t_pos  # how many frames before current frame
@@ -646,9 +668,9 @@ class Sam3TrackerBase(torch.nn.Module):
                     # If an unselected conditioning frame is among the last (self.num_maskmem - 1)
                     # frames, we still attend to it as if it's a non-conditioning frame.
                     out = unselected_cond_outputs.get(prev_frame_idx, None)
-                t_pos_and_prevs.append((t_pos, out, False))
+                t_pos_and_prevs.append((t_pos, out, False, prev_frame_idx))
 
-            for t_pos, prev, is_selected_cond_frame in t_pos_and_prevs:
+            for t_pos, prev, is_selected_cond_frame, src_frame_idx in t_pos_and_prevs:
                 if prev is None:
                     continue  # skip padding frames
                 # "maskmem_features" might have been offloaded to CPU in demo use cases,
@@ -672,6 +694,16 @@ class Sam3TrackerBase(torch.nn.Module):
 
                 # Temporal positional encoding
                 t = t_pos if not is_selected_cond_frame else 0
+                if mem_debug is not None:
+                    # Spatial memories actually attended this frame: cond frames carry
+                    # t_pos 0, non-cond ones their slot (1..num_maskmem-1).
+                    mem_debug["spatial_mem"].append(
+                        {
+                            "frame_idx": int(src_frame_idx),
+                            "t_pos": int(t),
+                            "is_cond": bool(is_selected_cond_frame),
+                        }
+                    )
                 maskmem_enc = (
                     maskmem_enc + self.maskmem_tpos_enc[self.num_maskmem - t - 1]
                 )
@@ -709,6 +741,7 @@ class Sam3TrackerBase(torch.nn.Module):
                     (frame_idx - t) * tpos_sign_mul,
                     out["obj_ptr"],
                     True,  # is_selected_cond_frame
+                    t,
                 )
                 for t, out in ptr_cond_outputs.items()
             ]
@@ -728,11 +761,26 @@ class Sam3TrackerBase(torch.nn.Module):
                     t, unselected_cond_outputs.get(t, None)
                 )
                 if out is not None:
-                    pos_and_ptrs.append((t_diff, out["obj_ptr"], False))
+                    pos_and_ptrs.append((t_diff, out["obj_ptr"], False, t))
 
             # If we have at least one object pointer, add them to the across attention
             if len(pos_and_ptrs) > 0:
-                pos_list, ptrs_list, is_selected_cond_frame_list = zip(*pos_and_ptrs)
+                pos_list, ptrs_list, is_selected_cond_frame_list, ptr_src_list = zip(
+                    *pos_and_ptrs
+                )
+                if mem_debug is not None:
+                    # `pos` is what feeds the temporal encoding: true frame distance
+                    # for cond frames, recency rank (t_diff) for non-cond frames.
+                    mem_debug["obj_ptrs"] = [
+                        {
+                            "frame_idx": int(src),
+                            "pos": int(pos),
+                            "is_cond": bool(is_cond),
+                        }
+                        for pos, is_cond, src in zip(
+                            pos_list, is_selected_cond_frame_list, ptr_src_list
+                        )
+                    ]
                 # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
                 obj_ptrs = torch.stack(ptrs_list, dim=0)
                 if getattr(self, "cond_frame_obj_ptr_embedding", None) is not None:

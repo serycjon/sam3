@@ -143,6 +143,16 @@ class MaskDecoder(nn.Module):
 
         # Select the correct mask or masks for output
         if multimask_output:
+            if getattr(self, "expose_token0_output", False) and not self.training:
+                # Stash the single-mask token's output (raw logits, before any
+                # no-object masking downstream), which the multimask path otherwise
+                # discards. Consumed and cleared by
+                # SAM3StreamingTracker.track(return_all_masks=True).
+                self.last_token0_out = (
+                    masks[:, 0:1, :, :],
+                    iou_pred[:, 0:1],
+                    self._get_stability_scores(masks[:, 0:1, :, :]),
+                )
             masks = masks[:, 1:, :, :]
             iou_pred = iou_pred[:, 1:]
         elif self.dynamic_multimask_via_stability and not self.training:

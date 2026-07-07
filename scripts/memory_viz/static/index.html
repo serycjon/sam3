@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SAM3 streaming memory</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>SAM3 streaming memory</h1>
+  <div id="controls">
+    <button id="btnPrev" title="previous record (←)">&#9664;</button>
+    <button id="btnPlay" title="play/pause (space)">&#9654;</button>
+    <button id="btnNext" title="next record (→)">&#9654;&#9654;</button>
+    <input type="range" id="slider" min="0" max="0" value="0">
+    <span id="posLabel" class="num"></span>
+    <label>fps <select id="fps">
+      <option>2</option><option selected>5</option><option>10</option><option>25</option>
+    </select></label>
+  </div>
+</header>
+
+<main>
+  <section id="currentPanel" class="panel">
+    <h2>frame <span id="frameNum" class="num"></span> <span id="eventBadge" class="badge"></span></h2>
+    <div class="frame-view" id="mainView">
+      <img id="mainThumb" alt="current frame">
+      <div class="mask-overlay" id="mainOverlay"></div>
+    </div>
+    <div id="overlayPicker" class="chip-row"></div>
+    <dl id="scoreList"></dl>
+    <div id="eventDetail" class="muted"></div>
+  </section>
+
+  <section id="poolsPanel" class="panel">
+    <h2>attended memories</h2>
+    <div class="pool" id="condPool">
+      <h3>conditioning <span class="muted">(slot 0)</span></h3>
+      <div class="cells"></div>
+    </div>
+    <div class="pool" id="spatialPool">
+      <h3>non-cond spatial <span class="muted">(slots 1…N, N = most recent)</span></h3>
+      <div class="cells"></div>
+    </div>
+    <div class="pool" id="ptrPool">
+      <h3>object pointers <span class="muted">(in attention order)</span></h3>
+      <div class="cells"></div>
+    </div>
+  </section>
+</main>
+
+<section id="bankPanel" class="panel">
+  <h2>memory bank <span class="muted">(everything stored after this step)</span></h2>
+  <div class="chip-row" id="roleLegend"></div>
+  <div class="cells" id="bankCells"></div>
+</section>
+
+<section id="chartPanel" class="panel">
+  <h2>eff_iou_score per frame <span class="muted">(click to seek)</span></h2>
+  <canvas id="chart" height="140"></canvas>
+  <div id="chartTip" class="tooltip" hidden></div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
