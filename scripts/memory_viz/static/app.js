@@ -11,10 +11,21 @@ const state = {
   pos: 0,
   playing: false,
   timer: null,
-  overlayKey: "final", // final | 0 | 1 | 2 | token0
+  selectedOverlayKey: null, // final | 0 | 1 | 2 | token0
+  visibleOverlayKeys: null, // Set of keys currently rendered in the main view.
+  overlayVisibilityTouched: false,
   mmCache: new Map(), // frame_idx -> multimask meta (or promise)
   chart: null, // geometry cache for hit-testing
 };
+
+const OVERLAY_COLORS = [
+  "#2a78d6",
+  "#e05a47",
+  "#19a974",
+  "#a45ee5",
+  "#e6a700",
+  "#00a8c8",
+];
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -175,11 +186,39 @@ function renderMainView(rec) {
 }
 
 function applyMainOverlay(frame) {
-  const key = state.overlayKey;
-  const url = key === "final"
-    ? `/masks/${pad6(frame)}.png`
-    : `/multimask/${frame}/${key}.png`;
-  setOverlay($("mainOverlay"), url);
+  applyMainOverlays(frame, [{ key: "final", color: cssVar("--mask-tint") }]);
+}
+
+function overlayUrl(frame, key) {
+  return key === "final" ? `/masks/${pad6(frame)}.png` : `/multimask/${frame}/${key}.png`;
+}
+
+function candidateColor(key) {
+  if (key === "final") return cssVar("--mask-tint");
+  if (key === "token0") return "#f06292";
+  const idx = Number(key);
+  return OVERLAY_COLORS[Number.isFinite(idx) ? idx % OVERLAY_COLORS.length : 0];
+}
+
+function outputMaskColor(mm) {
+  if (!mm.available || !mm.ious || !mm.ious.length) return cssVar("--mask-tint");
+  return candidateColor(String(mm.ious.indexOf(Math.max(...mm.ious))));
+}
+
+function applyMainOverlays(frame, options) {
+  const layer = $("mainOverlays");
+  layer.innerHTML = "";
+  const visible = state.visibleOverlayKeys || new Set(["final"]);
+  for (const opt of options) {
+    if (!visible.has(opt.key)) continue;
+    const ov = document.createElement("div");
+    ov.className = `mask-overlay candidate-overlay ${state.selectedOverlayKey === opt.key ? "selected" : ""}`;
+    ov.style.background = opt.color || candidateColor(opt.key);
+    ov.style.color = opt.color || candidateColor(opt.key);
+    ov.style.zIndex = state.selectedOverlayKey === opt.key ? "2" : "1";
+    layer.append(ov);
+    setOverlay(ov, overlayUrl(frame, opt.key));
+  }
 }
 
 async function renderOverlayPicker(rec) {
@@ -189,24 +228,53 @@ async function renderOverlayPicker(rec) {
   const mm = await multimaskMeta(frame);
   if (rec !== state.log[state.pos]) return; // stale async result
 
-  const options = [{ key: "final", label: "output mask" }];
+  const options = [{ key: "final", label: "output mask", color: outputMaskColor(mm) }];
   if (mm.available) {
     for (let k = 0; k < (mm.n_candidates || 0); k++) {
-      options.push({ key: String(k), label: `cand ${k}`, num: `iou ${fmt(mm.ious[k], 2)}` });
+      options.push({
+        key: String(k),
+        label: `cand ${k}`,
+        num: `iou ${fmt(mm.ious[k], 2)}`,
+        color: candidateColor(String(k)),
+      });
     }
     if (mm.token0_iou !== undefined) {
       options.push({
         key: "token0",
         label: "token0",
         num: `iou ${fmt(mm.token0_iou, 2)} · stab ${fmt(mm.token0_stability, 2)}`,
+        color: candidateColor("token0"),
       });
     }
   }
-  if (!options.some((o) => o.key === state.overlayKey)) state.overlayKey = "final";
+  const keys = new Set(options.map((o) => o.key));
+  if (state.visibleOverlayKeys === null || (mm.available && !state.overlayVisibilityTouched)) {
+    const defaultKeys = options.filter((o) => mm.available ? o.key !== "final" : o.key === "final").map((o) => o.key);
+    state.visibleOverlayKeys = new Set(defaultKeys.length ? defaultKeys : ["final"]);
+    if (mm.available && mm.ious && mm.ious.length) {
+      state.selectedOverlayKey = String(mm.ious.indexOf(Math.max(...mm.ious)));
+    }
+  } else {
+    state.visibleOverlayKeys = new Set([...state.visibleOverlayKeys].filter((key) => keys.has(key)));
+    if (!state.visibleOverlayKeys.size && (!state.overlayVisibilityTouched || !mm.available)) {
+      state.visibleOverlayKeys.add("final");
+    }
+  }
+  if (!state.selectedOverlayKey || !keys.has(state.selectedOverlayKey)) {
+    state.selectedOverlayKey = mm.available && mm.ious && mm.ious.length
+      ? String(mm.ious.indexOf(Math.max(...mm.ious)))
+      : "final";
+  }
+  applyMainOverlays(frame, options);
 
   for (const opt of options) {
     const chip = document.createElement("button");
-    chip.className = `chip ${state.overlayKey === opt.key ? "active" : ""}`;
+    const shown = state.visibleOverlayKeys.has(opt.key);
+    chip.className = `chip overlay-chip ${shown ? "shown" : ""} ${state.selectedOverlayKey === opt.key ? "active" : ""}`;
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = opt.color;
+    chip.append(sw);
     chip.append(opt.label);
     if (opt.num) {
       const n = document.createElement("span");
@@ -215,8 +283,19 @@ async function renderOverlayPicker(rec) {
       chip.append(n);
     }
     chip.onclick = () => {
-      state.overlayKey = opt.key;
-      applyMainOverlay(frame);
+      state.overlayVisibilityTouched = true;
+      if (!state.visibleOverlayKeys.has(opt.key)) {
+        state.visibleOverlayKeys.add(opt.key);
+        state.selectedOverlayKey = opt.key;
+      } else if (state.selectedOverlayKey !== opt.key) {
+        state.selectedOverlayKey = opt.key;
+      } else {
+        state.visibleOverlayKeys.delete(opt.key);
+        if (state.selectedOverlayKey === opt.key) {
+          state.selectedOverlayKey = state.visibleOverlayKeys.values().next().value || opt.key;
+        }
+      }
+      applyMainOverlays(frame, options);
       renderOverlayPicker(rec);
     };
     picker.append(chip);
