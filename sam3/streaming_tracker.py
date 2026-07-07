@@ -133,6 +133,10 @@ class SAM3StreamingTracker:
         self.inference_state["streaming"] = True
         self.frame_idx = 0
         self._last_frame = frame.copy()
+        # init() starts a fresh sequence, so drop any debug records accumulated from
+        # a previous sequence tracked with this same tracker instance (the log only
+        # ever appends otherwise, which would concatenate sequences in one dump).
+        self.debug_log = []
 
         # Add the initial mask
         self.predictor.add_new_mask_direct(
