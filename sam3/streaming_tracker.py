@@ -77,14 +77,15 @@ class SAM3StreamingTracker:
         predictor.keep_first_cond_frame = keep_first_cond_frame
 
         self.predictor = predictor
-        # Have the mask decoder stash the single-mask token's output (token 0),
-        # which the multimask tracking path otherwise discards; exposed via
-        # track(return_all_masks=True).
-        predictor.sam_mask_decoder.expose_token0_output = True
         self.obj_id = 1
         self.accumulate_corrections = accumulate_corrections
         self.clear_recent_memory_on_correct = clear_recent_memory_on_correct
         self.debug = debug
+        # Only in debug mode, have the mask decoder stash the single-mask token's
+        # output (token 0), which the multimask tracking path otherwise discards;
+        # exposed via track(return_all_masks=True). Kept off by default so the decoder
+        # never retains an extra per-frame tensor tuple on the normal tracking path.
+        predictor.sam_mask_decoder.expose_token0_output = debug
         predictor.mem_debug_enabled = debug
         self.debug_log: List[Dict[str, Any]] = []
         self.debug_config: Dict[str, Any] = {
@@ -184,7 +185,9 @@ class SAM3StreamingTracker:
                 masking applied to the candidates;
               - ``"token0_iou"`` / ``"token0_stability"``: floats, the predicted IoU
                 and the stability score of the single-mask token's output.
-                The token0 keys are absent when the frame was not freshly tracked.
+                The token0 keys are only present in debug mode (``debug=True``,
+                which enables the decoder's token-0 stash) and absent when the frame
+                was not freshly tracked.
             These are computed for the current frame only and are not stored in memory.
         """
         if self.inference_state is None:
